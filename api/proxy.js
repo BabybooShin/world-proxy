@@ -1,65 +1,83 @@
-const TARGET = 'https://worldmonitor-eight-jet.vercel.app';
+const TARGET_BASE = 'https://worldmonitor-eight-jet.vercel.app';
 
 export default async function handler(req, res) {
-  const path = req.url.replace(/^\/api\/proxy/, '') || '/';
-  const targetUrl = TARGET + path;
+  // Lấy path sau /api/proxy
+  let path = req.url.replace(/^\/api\/proxy/, '') || '/';
+  if (!path.startsWith('/')) path = '/' + path;
+
+  const targetUrl = TARGET_BASE + path;
 
   try {
-    const headers = { ...req.headers };
-    delete headers['host'];
-    delete headers['x-forwarded-for'];
-    delete headers['x-vercel-id'];
-    headers['host'] = 'worldmonitor-eight-jet.vercel.app';
-    headers['referer'] = TARGET + '/';
-    headers['origin'] = TARGET;
+    const reqHeaders = {};
+    const skip = new Set(['host','x-forwarded-for','x-vercel-id','x-vercel-deployment-url','x-vercel-forwarded-for','x-real-ip','cf-ray','cf-connecting-ip']);
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (!skip.has(k.toLowerCase())) reqHeaders[k] = v;
+    }
+    reqHeaders['host'] = 'worldmonitor-eight-jet.vercel.app';
+    reqHeaders['origin'] = TARGET_BASE;
+    reqHeaders['referer'] = TARGET_BASE + '/';
 
-    const fetchRes = await fetch(targetUrl, {
+    const fetchOptions = {
       method: req.method,
-      headers,
-      body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
+      headers: reqHeaders,
       redirect: 'follow',
-    });
+    };
+    if (!['GET', 'HEAD'].includes(req.method)) {
+      fetchOptions.body = req.body;
+    }
 
-    // Copy status
-    res.status(fetchRes.status);
+    const upstream = await fetch(targetUrl, fetchOptions);
 
-    // Copy headers nhưng XÓA các header chặn iframe
-    fetchRes.headers.forEach((value, key) => {
-      const lower = key.toLowerCase();
-      if (
-        lower === 'x-frame-options' ||
-        lower === 'content-security-policy' ||
-        lower === 'x-content-type-options' ||
-        lower === 'transfer-encoding' ||
-        lower === 'content-encoding'
-      ) return;
-      res.setHeader(key, value);
-    });
+    // Xóa headers chặn iframe
+    const BLOCKED_HEADERS = new Set([
+      'x-frame-options',
+      'content-security-policy',
+      'x-content-type-options',
+      'transfer-encoding',
+    ]);
 
-    // Cho phép nhúng từ mọi nơi
+    res.status(upstream.status);
+    for (const [k, v] of upstream.headers.entries()) {
+      if (!BLOCKED_HEADERS.has(k.toLowerCase())) {
+        res.setHeader(k, v);
+      }
+    }
     res.setHeader('X-Frame-Options', 'ALLOWALL');
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
 
-    const contentType = fetchRes.headers.get('content-type') || '';
+    const ct = upstream.headers.get('content-type') || '';
 
-    if (contentType.includes('text/html')) {
-      let html = await fetchRes.text();
-      // Rewrite absolute URLs và relative paths về qua proxy
-      html = html
-        .replace(/(href|src|action)="\/(?!\/)/g, `$1="/api/proxy/`)
-        .replace(/(href|src|action)='\/(?!\/)/g, `$1='/api/proxy/`)
-        .replace(
-          new RegExp(`(href|src|action)="${TARGET.replace(/\//g, '\\/')}`, 'g'),
-          '$1="/api/proxy'
-        );
+    if (ct.includes('text/html')) {
+      let html = await upstream.text();
+
+      // Base tag để relative URLs resolve đúng
+      const baseTag = `<base href="${TARGET_BASE}/">`;
+      html = html.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
+
+      // Inject script để fix navigation trong iframe
+      const fixScript = `
+<script>
+(function(){
+  // Override fetch để đi qua proxy nếu cần
+  const _orig = window.fetch;
+  window.fetch = function(url, opts) {
+    return _orig.call(this, url, opts);
+  };
+})();
+</script>`;
+      html = html.replace('</head>', fixScript + '</head>');
+
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.send(html);
+      res.setHeader('Content-Length', Buffer.byteLength(html, 'utf-8').toString());
+      res.end(html);
     } else {
-      const buf = await fetchRes.arrayBuffer();
-      res.send(Buffer.from(buf));
+      // Stream binary as-is
+      const buf = await upstream.arrayBuffer();
+      res.end(Buffer.from(buf));
     }
   } catch (err) {
-    console.error('Proxy error:', err);
-    res.status(502).json({ error: 'Proxy error', detail: err.message });
+    console.error('[proxy error]', err);
+    res.status(502).json({ error: 'Proxy error', message: err.message, url: targetUrl });
   }
 }
